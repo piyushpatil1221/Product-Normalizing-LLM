@@ -1,0 +1,88 @@
+version: "3.9"
+
+services:
+  # ── Ollama — local LLM server ─────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: llm_normalizer_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama   # persist downloaded models
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── Model pull (runs once, pulls llama3.2 if not already downloaded) ──────────
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: llm_normalizer_model_pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: ["ollama", "pull", "llama3.2"]
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    restart: "no"
+
+  # ── FastAPI backend ────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: llm_normalizer_api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data          # persist CSV outputs
+      - ./logs:/app/logs          # persist logs
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=llama3.2
+      - PYTHONPATH=/app
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 3
+    command: ["uvicorn", "api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  # ── Streamlit dashboard ────────────────────────────────────────────────────────
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: llm_normalizer_streamlit
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=llama3.2
+      - PYTHONPATH=/app
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+    command:
+      - "streamlit"
+      - "run"
+      - "streamlit/app.py"
+      - "--server.port=8501"
+      - "--server.address=0.0.0.0"
+      - "--server.headless=true"
+      - "--browser.gatherUsageStats=false"
+
+volumes:
+  ollama_models:
+    name: llm_normalizer_ollama_models
