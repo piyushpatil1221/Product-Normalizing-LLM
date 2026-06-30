@@ -29,7 +29,6 @@ And converts them to clean, structured JSON:
   "product_name": "Apple iPhone 15 128GB",
   "brand": "Apple",
   "category": "Mobile",
-  "price": 79999,
   "currency": "INR",
   "offer": "Flat ₹5000 OFF with HDFC Card",
   "availability": "Limited Stock",
