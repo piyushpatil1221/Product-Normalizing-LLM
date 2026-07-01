@@ -24,7 +24,7 @@ import ollama
 
 from src.config import settings
 from src.logger import get_logger
-from src.utils import safe_json_parse
+from src.utils import fix_null_price, safe_json_parse
 
 log = get_logger(__name__)
 
@@ -202,6 +202,8 @@ class LLMParser:
                 parsed = safe_json_parse(raw_output)
 
                 if parsed is not None:
+                    # Apply regex fallback to recover any price the LLM missed
+                    parsed = fix_null_price(parsed, raw_description)
                     log.debug(f"[ID={product_id}] JSON parsed successfully on attempt {attempt}")
                     return parsed, retry_count, last_raw
 

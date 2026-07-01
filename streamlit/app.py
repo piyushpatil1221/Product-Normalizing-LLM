@@ -34,7 +34,13 @@ from src.config import settings
 from src.exporter import errors_to_dataframe, products_to_dataframe
 from src.llm_parser import LLMParser, OllamaClient
 from src.postprocess import postprocess_product
-from src.preprocess import clean_description, preprocess_dataframe
+from src.preprocess import (
+    build_description_from_columns,
+    clean_description,
+    detect_description_columns,
+    load_input_file,
+    preprocess_dataframe,
+)
 from src.schemas import ErrorRecord, NormalizedProduct, RawProduct
 from src.validator import validate_product
 
@@ -183,35 +189,91 @@ def metric_card(value: str, label: str, css_class: str = "") -> str:
 # Tab 1 — Upload & Normalize
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_upload:
-    st.markdown('<div class="section-header">Upload Raw Product CSV</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">Upload Web-Scraped Product Data</div>', unsafe_allow_html=True)
     st.markdown(
-        "Upload a CSV with a **`raw_description`** column (or any column with 'description' "
-        "in the name). The pipeline will clean, parse with llama3.2, validate, and normalise."
+        "Upload **any web-scraped file** — CSV, JSON, JSONL, or Excel. "
+        "Select which columns carry product information and the pipeline will "
+        "merge them into a labeled description, then normalize with llama3.2."
     )
 
     uploaded = st.file_uploader(
-        "Drop your CSV here", type=["csv"], label_visibility="collapsed"
+        "Drop your file here",
+        type=["csv", "json", "jsonl", "xlsx", "xls"],
+        label_visibility="collapsed",
     )
 
     if uploaded:
-        raw_df = pd.read_csv(uploaded, dtype=str)
+        # ── Load file ──────────────────────────────────────────────────────────
+        file_ext = Path(uploaded.name).suffix.lower()
+        try:
+            if file_ext == ".csv":
+                raw_df = pd.read_csv(uploaded, dtype=str).fillna("")
+            elif file_ext == ".json":
+                raw_df = pd.read_json(uploaded, orient="records").astype(str).fillna("")
+            elif file_ext == ".jsonl":
+                raw_df = pd.read_json(uploaded, lines=True).astype(str).fillna("")
+            elif file_ext in (".xlsx", ".xls"):
+                raw_df = pd.read_excel(uploaded, dtype=str).fillna("")
+            else:
+                raw_df = pd.read_csv(uploaded, dtype=str).fillna("")
+        except Exception as exc:
+            st.error(f"❌ Could not parse file: {exc}")
+            st.stop()
+
         st.markdown('<div class="section-header">Raw Data Preview</div>', unsafe_allow_html=True)
         st.dataframe(raw_df.head(10), use_container_width=True)
-        st.caption(f"📄 {len(raw_df)} total rows detected")
+        st.caption(f"📄 {len(raw_df)} total rows · {len(raw_df.columns)} columns detected")
 
+        # ── Column selector ────────────────────────────────────────────────────
+        st.markdown('<div class="section-header">Column Mapping</div>', unsafe_allow_html=True)
+
+        auto_cols = detect_description_columns(raw_df)
+
+        # If file already has raw_description, skip selector entirely
+        if "raw_description" in raw_df.columns and len(raw_df.columns) == 1:
+            selected_cols = ["raw_description"]
+            st.info("✅ Detected single `raw_description` column — using it directly.")
+        else:
+            selected_cols = st.multiselect(
+                "Select columns to include in the product description (order matters):",
+                options=list(raw_df.columns),
+                default=auto_cols,
+                help=(
+                    "Columns you select will be concatenated as labeled fields "
+                    "(e.g. 'Title: …\\nPrice: …') and sent to the LLM. "
+                    "Leave the auto-detected defaults or customise as needed."
+                ),
+            )
+
+        if not selected_cols:
+            st.warning("⚠️ Select at least one column to proceed.")
+            st.stop()
+
+        # ── Description preview ────────────────────────────────────────────────
+        with st.expander("🔍 Preview — how row 1 will look to the LLM", expanded=False):
+            if len(raw_df) > 0:
+                sample_row = raw_df.iloc[0]
+                preview_text = build_description_from_columns(sample_row, selected_cols)
+                st.code(preview_text, language="text")
+            else:
+                st.info("No rows to preview.")
+
+        # ── Run button ─────────────────────────────────────────────────────────
         col_run, col_spacer = st.columns([1, 3])
         with col_run:
             run_btn = st.button("🚀 Run Normalization", type="primary", use_container_width=True)
 
         if run_btn:
-            # Identify desc column
-            desc_col = next(
-                (c for c in raw_df.columns if "description" in c.lower()),
-                raw_df.columns[0],
+            # ── Build raw_description from selected columns ─────────────────
+            work_df = raw_df.copy()
+            work_df["raw_description"] = work_df.apply(
+                lambda row: build_description_from_columns(row, selected_cols),
+                axis=1,
             )
-            raw_df = raw_df.rename(columns={desc_col: "raw_description"})
-            raw_df = preprocess_dataframe(raw_df)
-            raw_df = raw_df.head(int(max_rows))
+
+            # ── Standard preprocessing (dedup, clean text, reset index) ─────
+            work_df = preprocess_dataframe(work_df)
+            work_df = work_df.head(int(max_rows))
 
             successes: list[NormalizedProduct] = []
             failures: list[ErrorRecord] = []
@@ -220,11 +282,11 @@ with tab_upload:
 
             progress_bar = st.progress(0, text="Initialising…")
             status_text = st.empty()
-            total = len(raw_df)
+            total = len(work_df)
 
             start_time = time.perf_counter()
 
-            for i, (_, row) in enumerate(raw_df.iterrows()):
+            for i, (_, row) in enumerate(work_df.iterrows()):
                 raw = RawProduct(
                     id=int(row["id"]),
                     raw_description=str(row["raw_description"]),
@@ -269,6 +331,7 @@ with tab_upload:
                 f"✅ Pipeline complete in **{elapsed:.1f}s** — "
                 f"{len(successes)} succeeded · {len(failures)} failed"
             )
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -2,7 +2,8 @@
 preprocess.py — Text preprocessing module for the normalization pipeline.
 
 Responsibilities:
-    - Load the raw CSV from disk
+    - Load any web-scraped input file (CSV, JSON, JSONL, Excel)
+    - Merge selected columns into a labeled description for the LLM
     - Remove HTML entities, control characters, and encoding artifacts
     - Normalize unicode, punctuation, and whitespace
     - Drop exact duplicates and empty descriptions
@@ -18,6 +19,7 @@ import html
 import re
 import unicodedata
 from pathlib import Path
+from typing import List, Optional
 
 import pandas as pd
 
@@ -124,35 +126,151 @@ def clean_description(text: str) -> str:
 
 # ── DataFrame-level operations ────────────────────────────────────────────────
 
-def load_raw_csv(path: Path | str) -> pd.DataFrame:
-    """
-    Load the raw product CSV.
+# Supported file extensions
+_SUPPORTED_EXTENSIONS = {".csv", ".json", ".jsonl", ".xlsx", ".xls"}
 
-    Expects at least one column whose name contains 'description' (case-insensitive).
-    Falls back to using the first column if no match is found.
+
+def load_input_file(path: Path | str) -> pd.DataFrame:
+    """
+    Load a web-scraped data file into a DataFrame.
+
+    Supports CSV, JSON (array of objects), JSONL (newline-delimited JSON),
+    and Excel (.xlsx / .xls) formats. All values are coerced to strings.
 
     Args:
-        path: Absolute path to the CSV file.
+        path: Absolute path to the input file.
 
     Returns:
-        DataFrame with a guaranteed 'raw_description' column.
+        Raw DataFrame with all original columns preserved.
 
     Raises:
         FileNotFoundError: If *path* does not exist.
+        ValueError: If the file extension is not supported.
     """
     path = Path(path)
     if not path.exists():
-        raise FileNotFoundError(f"Input CSV not found: {path}")
+        raise FileNotFoundError(f"Input file not found: {path}")
 
-    df = pd.read_csv(path, encoding="utf-8", dtype=str)
-    log.info(f"Loaded {len(df)} rows from {path.name}")
+    ext = path.suffix.lower()
+    if ext not in _SUPPORTED_EXTENSIONS:
+        raise ValueError(
+            f"Unsupported file type '{ext}'. "
+            f"Supported: {', '.join(sorted(_SUPPORTED_EXTENSIONS))}"
+        )
 
-    # Identify the description column
+    if ext == ".csv":
+        df = pd.read_csv(path, encoding="utf-8", dtype=str)
+    elif ext == ".json":
+        df = pd.read_json(path, orient="records", dtype=str)
+        df = df.astype(str)
+    elif ext == ".jsonl":
+        df = pd.read_json(path, lines=True, dtype=str)
+        df = df.astype(str)
+    elif ext in (".xlsx", ".xls"):
+        df = pd.read_excel(path, dtype=str)
+    else:
+        df = pd.read_csv(path, encoding="utf-8", dtype=str)
+
+    # Replace literal 'nan' strings (from dtype=str conversion) with empty string
+    df = df.fillna("")
+
+    log.info(f"Loaded {len(df)} rows from '{path.name}' ({ext} format)")
+    return df
+
+
+def detect_description_columns(df: pd.DataFrame) -> List[str]:
+    """
+    Auto-detect which columns are likely to carry useful product information.
+
+    Heuristic: prefer columns whose names suggest product text, or fall back
+    to all non-numeric-looking columns. A column named 'raw_description' is
+    always returned alone (backward compatibility).
+
+    Args:
+        df: DataFrame from any supported input format.
+
+    Returns:
+        Ordered list of column names to use as description source.
+    """
+    cols = list(df.columns)
+
+    # Exact backward-compat shortcut
+    if "raw_description" in cols:
+        return ["raw_description"]
+
+    # Prefer columns with description-like names first
+    PRIORITY_KEYWORDS = [
+        "description", "title", "name", "product", "item",
+        "brand", "price", "offer", "discount", "availability",
+        "stock", "delivery", "seller", "category", "badge",
+        "detail", "spec", "feature",
+    ]
+
+    priority = [
+        c for c in cols
+        if any(kw in c.lower() for kw in PRIORITY_KEYWORDS)
+    ]
+    rest = [c for c in cols if c not in priority]
+
+    ordered = priority + rest
+
+    # Filter out columns that are entirely empty
+    non_empty = [c for c in ordered if df[c].str.strip().any()]
+
+    return non_empty if non_empty else ordered
+
+
+def build_description_from_columns(
+    row: "pd.Series",
+    columns: List[str],
+    labeled: bool = True,
+) -> str:
+    """
+    Build a single LLM-ready description string from multiple DataFrame columns.
+
+    When *labeled* is True (recommended), each field is prefixed with its
+    column name so the LLM understands the semantic meaning of each value::
+
+        Title: Apple iPhone 15 128GB
+        Price: ₹79,999
+        Availability: Only 2 Left
+
+    Args:
+        row:     A single DataFrame row (pd.Series).
+        columns: List of column names to include.
+        labeled: If True, prefix each value with its column name.
+
+    Returns:
+        A multi-line string ready to be injected into the LLM prompt.
+    """
+    parts = []
+    for col in columns:
+        val = str(row.get(col, "")).strip()
+        if val and val.lower() not in ("nan", "none", ""):
+            if labeled:
+                label = col.replace("_", " ").title()
+                parts.append(f"{label}: {val}")
+            else:
+                parts.append(val)
+    return "\n".join(parts)
+
+
+def load_raw_csv(path: Path | str) -> pd.DataFrame:
+    """
+    Legacy loader — kept for backward compatibility.
+
+    Loads a CSV and renames the first column that contains 'description'
+    (case-insensitive) to 'raw_description'. Falls back to column 1.
+
+    New code should use :func:`load_input_file` instead.
+    """
+    df = load_input_file(path)
+
+    # Identify the description column (backward-compat behaviour)
     desc_col = next(
         (c for c in df.columns if "description" in c.lower()),
         df.columns[0],
     )
-
     if desc_col != "raw_description":
         df = df.rename(columns={desc_col: "raw_description"})
 

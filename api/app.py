@@ -4,7 +4,7 @@ api/app.py — FastAPI backend for the LLM Product Normalization Pipeline.
 Endpoints:
     GET  /health           — liveness check; confirms Ollama is reachable
     POST /normalize        — normalize a single raw product description
-    POST /upload           — upload a CSV, normalize all rows, return results
+    POST /upload           — upload a CSV/JSON/JSONL/Excel file, normalize all rows
 
 All endpoints return JSON. Errors are returned as standard HTTP error
 responses with descriptive detail messages.
@@ -31,7 +31,12 @@ from src.exporter import errors_to_dataframe, products_to_dataframe
 from src.llm_parser import LLMParser, OllamaClient
 from src.logger import get_logger
 from src.postprocess import postprocess_batch, postprocess_product
-from src.preprocess import clean_description, preprocess_dataframe
+from src.preprocess import (
+    build_description_from_columns,
+    clean_description,
+    detect_description_columns,
+    preprocess_dataframe,
+)
 from src.schemas import ErrorRecord, NormalizedProduct, RawProduct
 from src.validator import validate_product
 
@@ -181,43 +186,77 @@ async def normalize_single(request: NormalizeRequest) -> NormalizeResponse:
 
 
 @app.post("/upload", response_model=UploadResponse, tags=["Normalization"])
-async def upload_csv(file: UploadFile = File(...)) -> UploadResponse:
+async def upload_file(
+    file: UploadFile = File(...),
+    columns: str | None = None,
+) -> UploadResponse:
     """
-    Upload a CSV file and normalize all product descriptions.
+    Upload a product data file and normalize all rows.
 
-    The uploaded file must contain at least one column with 'description'
-    in its name (case-insensitive). The first column is used as a fallback.
+    Accepts **CSV, JSON (array of objects), JSONL, or Excel (.xlsx/.xls)**.
+
+    - If the file has a single `raw_description` column it is used directly.
+    - Otherwise, all non-empty columns are merged into a labeled description
+      (e.g. `Title: Apple iPhone 15\\nPrice: ₹79,999`) and sent to the LLM.
+    - Use the optional **columns** query parameter to specify exactly which
+      columns to merge, e.g. `?columns=title,price,availability`.
 
     Returns a JSON payload with:
     - **results**: successfully normalized records
     - **error_records**: records that failed
     - **success_rate**: percentage of successfully normalized rows
     """
-    if not file.filename or not file.filename.endswith(".csv"):
-        raise HTTPException(status_code=400, detail="Only .csv files are accepted")
+    SUPPORTED = {".csv", ".json", ".jsonl", ".xlsx", ".xls"}
+    filename = file.filename or ""
+    ext = Path(filename).suffix.lower()
 
-    log.info(f"[/upload] Received file: {file.filename}")
+    if ext not in SUPPORTED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'. Accepted: {', '.join(sorted(SUPPORTED))}",
+        )
 
-    # Read CSV
+    log.info(f"[/upload] Received file: {filename} ({ext})")
+
     content = await file.read()
     try:
-        df = pd.read_csv(io.BytesIO(content), dtype=str)
+        if ext == ".csv":
+            df = pd.read_csv(io.BytesIO(content), dtype=str).fillna("")
+        elif ext == ".json":
+            df = pd.read_json(io.BytesIO(content), orient="records").astype(str).fillna("")
+        elif ext == ".jsonl":
+            df = pd.read_json(io.BytesIO(content), lines=True).astype(str).fillna("")
+        elif ext in (".xlsx", ".xls"):
+            df = pd.read_excel(io.BytesIO(content), dtype=str).fillna("")
+        else:
+            df = pd.read_csv(io.BytesIO(content), dtype=str).fillna("")
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to parse CSV: {exc}")
+        raise HTTPException(status_code=400, detail=f"Failed to parse file: {exc}")
 
-    # Identify description column
-    desc_col = next(
-        (c for c in df.columns if "description" in c.lower()),
-        df.columns[0] if len(df.columns) > 0 else None,
+    if df.empty or len(df.columns) == 0:
+        raise HTTPException(status_code=400, detail="File has no usable data")
+
+    # Resolve which columns to merge
+    if columns:
+        selected_cols = [c.strip() for c in columns.split(",") if c.strip() in df.columns]
+        if not selected_cols:
+            raise HTTPException(
+                status_code=400,
+                detail=f"None of the requested columns exist. Available: {list(df.columns)}",
+            )
+    else:
+        selected_cols = detect_description_columns(df)
+
+    # Build raw_description
+    df["raw_description"] = df.apply(
+        lambda row: build_description_from_columns(row, selected_cols),
+        axis=1,
     )
-    if desc_col is None:
-        raise HTTPException(status_code=400, detail="CSV has no columns")
 
-    df = df.rename(columns={desc_col: "raw_description"})
     df = preprocess_dataframe(df)
     df = df.head(100)  # Cap at 100 rows for API safety
 
-    log.info(f"[/upload] Processing {len(df)} rows…")
+    log.info(f"[/upload] Processing {len(df)} rows using columns: {selected_cols}…")
 
     parser = get_parser()
     successes: list[NormalizedProduct] = []
